@@ -4,50 +4,73 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/pprof"
 	"os"
-	"time"
+	"strings"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/sync/semaphore"
 
 	exporter "github.com/nerdswords/yet-another-cloudwatch-exporter/pkg"
+	"github.com/nerdswords/yet-another-cloudwatch-exporter/pkg/clients/cloudwatch"
+	v1 "github.com/nerdswords/yet-another-cloudwatch-exporter/pkg/clients/v1"
+	v2 "github.com/nerdswords/yet-another-cloudwatch-exporter/pkg/clients/v2"
+	"github.com/nerdswords/yet-another-cloudwatch-exporter/pkg/config"
+	"github.com/nerdswords/yet-another-cloudwatch-exporter/pkg/logging"
+)
+
+const (
+	enableFeatureFlag = "enable-feature"
+	htmlVersion       = `<html>
+<head><title>Yet Another CloudWatch Exporter</title></head>
+<body>
+<h1>Thanks for using YACE :)</h1>
+Version: %s
+<p><a href="/metrics">Metrics</a></p>
+%s
+</body>
+</html>`
+	htmlPprof = `<p><a href="/debug/pprof">Pprof</a><p>`
 )
 
 var version = "custom-build"
 
 var sem = semaphore.NewWeighted(1)
 
+const (
+	defaultLogFormat = "json"
+)
+
 var (
 	addr                  string
 	configFile            string
 	debug                 bool
+	logFormat             string
 	fips                  bool
-	cloudwatchConcurrency int
+	cloudwatchConcurrency cloudwatch.ConcurrencyConfig
 	tagConcurrency        int
 	scrapingInterval      int
 	metricsPerQuery       int
 	labelsSnakeCase       bool
+	profilingEnabled      bool
 
-	config = exporter.ScrapeConf{}
+	logger logging.Logger
 )
 
-func init() {
-
-	// Set JSON structured logging as the default log formatter
-	log.SetFormatter(&log.JSONFormatter{})
-
-	// Set the Output to stdout instead of the default stderr
-	log.SetOutput(os.Stdout)
-
-	// Only log Info severity or above.
-	log.SetLevel(log.InfoLevel)
-
+func main() {
+	app := NewYACEApp()
+	if err := app.Run(os.Args); err != nil {
+		// if we exit very early we'll not have set up the logger yet
+		if logger == nil {
+			logger = logging.NewLogger(defaultLogFormat, debug, "version", version)
+		}
+		logger.Error(err, "Error running yace")
+		os.Exit(1)
+	}
 }
 
-func main() {
+// NewYACEApp creates a new cli.App implementing the YACE entrypoints and CLI arguments.
+func NewYACEApp() *cli.App {
 	yace := cli.NewApp()
 	yace.Name = "Yet Another CloudWatch Exporter"
 	yace.Version = version
@@ -58,172 +81,249 @@ func main() {
 	}
 
 	yace.Flags = []cli.Flag{
-		&cli.StringFlag{Name: "listen-address", Value: ":5000", Usage: "The address to listen on.", Destination: &addr, EnvVars: []string{"listen-address"}},
-		&cli.StringFlag{Name: "config.file", Value: "config.yml", Usage: "Path to configuration file.", Destination: &configFile, EnvVars: []string{"config.file"}},
-		&cli.BoolFlag{Name: "debug", Value: false, Usage: "Add verbose logging.", Destination: &debug, EnvVars: []string{"debug"}},
-		&cli.BoolFlag{Name: "fips", Value: false, Usage: "Use FIPS compliant aws api.", Destination: &fips},
-		&cli.IntFlag{Name: "cloudwatch-concurrency", Value: 5, Usage: "Maximum number of concurrent requests to CloudWatch API.", Destination: &cloudwatchConcurrency},
-		&cli.IntFlag{Name: "tag-concurrency", Value: 5, Usage: "Maximum number of concurrent requests to Resource Tagging API.", Destination: &tagConcurrency},
-		&cli.IntFlag{Name: "scraping-interval", Value: 300, Usage: "Seconds to wait between scraping the AWS metrics", Destination: &scrapingInterval, EnvVars: []string{"scraping-interval"}},
-		&cli.IntFlag{Name: "metrics-per-query", Value: 500, Usage: "Number of metrics made in a single GetMetricsData request", Destination: &metricsPerQuery, EnvVars: []string{"metrics-per-query"}},
-		&cli.BoolFlag{Name: "labels-snake-case", Value: false, Usage: "If labels should be output in snake case instead of camel case", Destination: &labelsSnakeCase},
+		&cli.StringFlag{
+			Name:        "listen-address",
+			Value:       ":5000",
+			Usage:       "The address to listen on",
+			Destination: &addr,
+			EnvVars:     []string{"listen-address"},
+		},
+		&cli.StringFlag{
+			Name:        "config.file",
+			Value:       "config.yml",
+			Usage:       "Path to configuration file",
+			Destination: &configFile,
+			EnvVars:     []string{"config.file"},
+		},
+		&cli.BoolFlag{
+			Name:        "debug",
+			Value:       false,
+			Usage:       "Verbose logging",
+			Destination: &debug,
+			EnvVars:     []string{"debug"},
+		},
+		&cli.StringFlag{
+			Name:        "log.format",
+			Value:       defaultLogFormat,
+			Usage:       "Output format of log messages. One of: [logfmt, json]. Default: [json].",
+			Destination: &logFormat,
+			Action: func(_ *cli.Context, s string) error {
+				switch s {
+				case "logfmt", "json":
+					break
+				default:
+					return fmt.Errorf("unrecognized log format %q", s)
+				}
+				return nil
+			},
+		},
+		&cli.BoolFlag{
+			Name:        "fips",
+			Value:       false,
+			Usage:       "Use FIPS compliant AWS API endpoints",
+			Destination: &fips,
+		},
+		&cli.IntFlag{
+			Name:        "cloudwatch-concurrency",
+			Value:       exporter.DefaultCloudwatchConcurrency.SingleLimit,
+			Usage:       "Maximum number of concurrent requests to CloudWatch API.",
+			Destination: &cloudwatchConcurrency.SingleLimit,
+		},
+		&cli.BoolFlag{
+			Name:        "cloudwatch-concurrency.per-api-limit-enabled",
+			Value:       exporter.DefaultCloudwatchConcurrency.PerAPILimitEnabled,
+			Usage:       "Whether to enable the per API CloudWatch concurrency limiter. When enabled, the concurrency `-cloudwatch-concurrency` flag will be ignored.",
+			Destination: &cloudwatchConcurrency.PerAPILimitEnabled,
+		},
+		&cli.IntFlag{
+			Name:        "cloudwatch-concurrency.list-metrics-limit",
+			Value:       exporter.DefaultCloudwatchConcurrency.ListMetrics,
+			Usage:       "Maximum number of concurrent requests to ListMetrics CloudWatch API. Used if the -cloudwatch-concurrency.per-api-limit-enabled concurrency limiter is enabled.",
+			Destination: &cloudwatchConcurrency.ListMetrics,
+		},
+		&cli.IntFlag{
+			Name:        "cloudwatch-concurrency.get-metric-data-limit",
+			Value:       exporter.DefaultCloudwatchConcurrency.GetMetricData,
+			Usage:       "Maximum number of concurrent requests to GetMetricData CloudWatch API. Used if the -cloudwatch-concurrency.per-api-limit-enabled concurrency limiter is enabled.",
+			Destination: &cloudwatchConcurrency.GetMetricData,
+		},
+		&cli.IntFlag{
+			Name:        "cloudwatch-concurrency.get-metric-statistics-limit",
+			Value:       exporter.DefaultCloudwatchConcurrency.GetMetricStatistics,
+			Usage:       "Maximum number of concurrent requests to GetMetricStatistics CloudWatch API. Used if the -cloudwatch-concurrency.per-api-limit-enabled concurrency limiter is enabled.",
+			Destination: &cloudwatchConcurrency.GetMetricStatistics,
+		},
+		&cli.IntFlag{
+			Name:        "tag-concurrency",
+			Value:       exporter.DefaultTaggingAPIConcurrency,
+			Usage:       "Maximum number of concurrent requests to Resource Tagging API.",
+			Destination: &tagConcurrency,
+		},
+		&cli.IntFlag{
+			Name:        "scraping-interval",
+			Value:       300,
+			Usage:       "Seconds to wait between scraping the AWS metrics",
+			Destination: &scrapingInterval,
+			EnvVars:     []string{"scraping-interval"},
+		},
+		&cli.IntFlag{
+			Name:        "metrics-per-query",
+			Value:       exporter.DefaultMetricsPerQuery,
+			Usage:       "Number of metrics made in a single GetMetricsData request",
+			Destination: &metricsPerQuery,
+			EnvVars:     []string{"metrics-per-query"},
+		},
+		&cli.BoolFlag{
+			Name:        "labels-snake-case",
+			Value:       exporter.DefaultLabelsSnakeCase,
+			Usage:       "Whether labels should be output in snake case instead of camel case",
+			Destination: &labelsSnakeCase,
+		},
+		&cli.BoolFlag{
+			Name:        "profiling.enabled",
+			Value:       false,
+			Usage:       "Enable pprof endpoints",
+			Destination: &profilingEnabled,
+		},
+		&cli.StringSliceFlag{
+			Name:  enableFeatureFlag,
+			Usage: "Comma-separated list of enabled features",
+		},
 	}
 
 	yace.Commands = []*cli.Command{
-		{Name: "verify-config", Aliases: []string{"vc"}, Usage: "Loads and attempts to parse config file, then exits. Useful for CICD validation",
+		{
+			Name:    "verify-config",
+			Aliases: []string{"vc"},
+			Usage:   "Loads and attempts to parse config file, then exits. Useful for CI/CD validation",
 			Flags: []cli.Flag{
 				&cli.StringFlag{Name: "config.file", Value: "config.yml", Usage: "Path to configuration file.", Destination: &configFile},
 			},
-			Action: func(c *cli.Context) error {
-				log.Info("Config ", configFile, " is valid")
+			Action: func(_ *cli.Context) error {
+				logger = logging.NewLogger(logFormat, debug, "version", version)
+				logger.Info("Parsing config")
+				cfg := config.ScrapeConf{}
+				if _, err := cfg.Load(configFile, logger); err != nil {
+					logger.Error(err, "Couldn't read config file", "path", configFile)
+					os.Exit(1)
+				}
+				logger.Info("Config file is valid", "path", configFile)
 				os.Exit(0)
 				return nil
-			}},
-		{Name: "version", Aliases: []string{"v"}, Usage: "prints current yace version.",
-			Action: func(c *cli.Context) error {
+			},
+		},
+		{
+			Name:    "version",
+			Aliases: []string{"v"},
+			Usage:   "prints current yace version.",
+			Action: func(_ *cli.Context) error {
 				fmt.Println(version)
 				os.Exit(0)
 				return nil
-			}},
+			},
+		},
 	}
 
-	err := yace.Run(os.Args)
+	yace.Action = startScraper
+
+	return yace
+}
+
+func startScraper(c *cli.Context) error {
+	logger = logging.NewLogger(logFormat, debug, "version", version)
+
+	// log warning if the two concurrency limiting methods are configured via CLI
+	if c.IsSet("cloudwatch-concurrency") && c.IsSet("cloudwatch-concurrency.per-api-limit-enabled") {
+		logger.Warn("Both `cloudwatch-concurrency` and `cloudwatch-concurrency.per-api-limit-enabled` are set. `cloudwatch-concurrency` will be ignored, and the per-api concurrency limiting strategy will be favoured.")
+	}
+
+	logger.Info("Parsing config")
+
+	cfg := config.ScrapeConf{}
+	jobsCfg, err := cfg.Load(configFile, logger)
 	if err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("Couldn't read %s: %w", configFile, err)
 	}
 
-	if debug {
-		log.SetLevel(log.DebugLevel)
-	}
-
-	log.Println("Parse config..")
-	if err := config.Load(&configFile); err != nil {
-		log.Fatal("Couldn't read ", configFile, ": ", err)
-		os.Exit(1)
-	}
-
-	log.Println("Startup completed")
-
-	var maxJobLength int64
-	for _, discoveryJob := range config.Discovery.Jobs {
-		length := exporter.GetMetricDataInputLength(discoveryJob)
-		//S3 can have upto 1 day to day will need to address it in seperate block
-		//TBD
-		svc := exporter.SupportedServices.GetService(discoveryJob.Type)
-		if (maxJobLength < length) && !svc.IgnoreLength {
-			maxJobLength = length
+	featureFlags := c.StringSlice(enableFeatureFlag)
+	s := NewScraper(featureFlags)
+	var cache cachingFactory = v1.NewFactory(logger, jobsCfg, fips)
+	for _, featureFlag := range featureFlags {
+		if featureFlag == config.AwsSdkV2 {
+			var err error
+			// Can't override cache while also creating err
+			cache, err = v2.NewFactory(logger, jobsCfg, fips)
+			if err != nil {
+				return fmt.Errorf("failed to construct aws sdk v2 client cache: %w", err)
+			}
 		}
 	}
 
-	s := NewScraper()
-	cache := exporter.NewSessionCache(config, fips, exporter.NewLogrusLogger(log.StandardLogger()))
-
 	ctx, cancelRunningScrape := context.WithCancel(context.Background())
-	go s.decoupled(ctx, cache)
+	go s.decoupled(ctx, logger, jobsCfg, cache)
 
-	http.HandleFunc("/metrics", s.makeHandler(ctx, cache))
+	mux := http.NewServeMux()
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`<html>
-    <head><title>Yet another cloudwatch exporter</title></head>
-    <body>
-    <h1>Thanks for using our product :)</h1>
-    <p><a href="/metrics">Metrics</a></p>
-    </body>
-    </html>`))
+	if profilingEnabled {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	}
+
+	mux.HandleFunc("/metrics", s.makeHandler())
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		pprofLink := ""
+		if profilingEnabled {
+			pprofLink = htmlPprof
+		}
+
+		_, _ = w.Write([]byte(fmt.Sprintf(htmlVersion, version, pprofLink)))
 	})
 
-	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
 
-	http.HandleFunc("/reload", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/reload", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		log.Println("Parse config..")
-		if err := config.Load(&configFile); err != nil {
-			log.Fatal("Couldn't read ", &configFile, ": ", err)
+
+		logger.Info("Parsing config")
+		newCfg := config.ScrapeConf{}
+		newJobsCfg, err := newCfg.Load(configFile, logger)
+		if err != nil {
+			logger.Error(err, "Couldn't read config file", "path", configFile)
+			return
 		}
 
-		log.Println("Reset session cache")
-		cache = exporter.NewSessionCache(config, fips, exporter.NewLogrusLogger(log.StandardLogger()))
+		logger.Info("Reset clients cache")
+		cache = v1.NewFactory(logger, newJobsCfg, fips)
+		for _, featureFlag := range featureFlags {
+			if featureFlag == config.AwsSdkV2 {
+				logger.Info("Using aws sdk v2")
+				var err error
+				// Can't override cache while also creating err
+				cache, err = v2.NewFactory(logger, newJobsCfg, fips)
+				if err != nil {
+					logger.Error(err, "Failed to construct aws sdk v2 client cache", "path", configFile)
+					return
+				}
+			}
+		}
 
 		cancelRunningScrape()
-		// TODO: Pipe ctx through to the AWS calls.
 		ctx, cancelRunningScrape = context.WithCancel(context.Background())
-		go s.decoupled(ctx, cache)
+		go s.decoupled(ctx, logger, newJobsCfg, cache)
 	})
 
-	log.Fatal(http.ListenAndServe(addr, nil))
-}
+	logger.Info("Yace startup completed", "version", version, "feature_flags", strings.Join(featureFlags, ","))
 
-type scraper struct {
-	cloudwatchSemaphore chan struct{}
-	tagSemaphore        chan struct{}
-	registry            *prometheus.Registry
-}
-
-func NewScraper() *scraper {
-	return &scraper{
-		cloudwatchSemaphore: make(chan struct{}, cloudwatchConcurrency),
-		tagSemaphore:        make(chan struct{}, tagConcurrency),
-		registry:            prometheus.NewRegistry(),
-	}
-}
-
-func (s *scraper) makeHandler(ctx context.Context, cache exporter.SessionCache) func(http.ResponseWriter, *http.Request) {
-	return func(w http.ResponseWriter, r *http.Request) {
-		handler := promhttp.HandlerFor(s.registry, promhttp.HandlerOpts{
-			DisableCompression: false,
-		})
-		handler.ServeHTTP(w, r)
-	}
-}
-
-func (s *scraper) decoupled(ctx context.Context, cache exporter.SessionCache) {
-	log.Debug("Starting scraping async")
-	log.Debug("Scrape initially first time")
-	s.scrape(ctx, cache)
-
-	scrapingDuration := time.Duration(scrapingInterval) * time.Second
-	ticker := time.NewTicker(scrapingDuration)
-	log.Debugf("Scraping every %d seconds", scrapingInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			log.Debug("Starting scraping async")
-			go s.scrape(ctx, cache)
-		}
-	}
-}
-
-var observedMetricLabels = map[string]exporter.LabelSet{}
-
-func (s *scraper) scrape(ctx context.Context, cache exporter.SessionCache) {
-	if !sem.TryAcquire(1) {
-		// This shouldn't happen under normal use, users should adjust their configuration when this occurs.
-		// Let them know by logging a warning.
-		log.Warn("Another scrape is already in process, will not start a new one. " +
-			"Adjust your configuration to ensure the previous scrape completes first.")
-		return
-	}
-	defer sem.Release(1)
-
-	newRegistry := prometheus.NewRegistry()
-	for _, metric := range exporter.Metrics {
-		if err := newRegistry.Register(metric); err != nil {
-			log.Warning("Could not register cloudwatch api metric")
-		}
-	}
-	exporter.UpdateMetrics(ctx, config, newRegistry, metricsPerQuery, labelsSnakeCase, s.cloudwatchSemaphore, s.tagSemaphore, cache, observedMetricLabels, exporter.NewLogrusLogger(log.StandardLogger()))
-
-	// this might have a data race to access registry
-	s.registry = newRegistry
-	log.Debug("Metrics scraped.")
+	srv := &http.Server{Addr: addr, Handler: mux}
+	return srv.ListenAndServe()
 }
