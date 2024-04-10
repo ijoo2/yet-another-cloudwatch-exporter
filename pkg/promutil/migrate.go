@@ -213,7 +213,7 @@ func createPrometheusLabels(cwd *model.CloudwatchData, labelsSnakeCase bool, con
 			logger.Warn("dimension name is an invalid prometheus label name", "dimension", dimension.Name)
 			continue
 		}
-		labels["dimension_"+promTag] = dimension.Value
+		labels[promTag] = dimension.Value
 	}
 
 	for _, tag := range cwd.Tags {
